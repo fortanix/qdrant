@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use rustls::client::VerifierBuilderError;
 use rustls::pki_types::CertificateDer;
-use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{crypto, RootCertStore, ServerConfig};
+use rustls::ServerConfig;
 use rustls_pemfile::Item;
+use rustls_pki_types::PrivateKeyDer;
 
 use crate::settings::{Settings, TlsConfig};
 
@@ -130,38 +130,36 @@ fn load_certified_key(tls_config: &TlsConfig) -> Result<Arc<CertifiedKey>> {
         Item::Sec1Key(pkey) => rustls_pki_types::PrivateKeyDer::from(pkey),
         _ => return Err(Error::InvalidPrivateKey),
     };
-    let signing_key = crypto::ring::sign::any_supported_type(&private_key).map_err(Error::Sign)?;
+    let signing_key = create_signing_key(&private_key)?;
 
     // Construct certified key
     let certified_key = CertifiedKey::new(certs, signing_key);
     Ok(Arc::new(certified_key))
 }
 
+#[cfg(feature = "rustls-mbedtls")]
+fn create_signing_key(private_key: &PrivateKeyDer) -> Result<Arc<dyn rustls::sign::SigningKey>> {
+    Ok(Arc::new(
+        rustls_mbedcrypto_provider::sign::MbedTlsPkSigningKeyWrapper::new(
+            private_key,
+            rustls_mbedcrypto_provider::rng::rng_new,
+        )
+        .map_err(Error::Sign)?,
+    ))
+}
+
+#[cfg(not(feature = "rustls-mbedtls"))]
+fn create_signing_key<'a>(
+    private_key: &PrivateKeyDer<'a>,
+) -> Result<Arc<dyn rustls::sign::SigningKey>> {
+    rustls::crypto::ring::sign::any_supported_type(&private_key).map_err(Error::Sign)
+}
+
 /// Generate an actix server configuration with TLS
 ///
 /// Uses TLS settings as configured in configuration by user.
 pub fn actix_tls_server_config(settings: &Settings) -> Result<ServerConfig> {
-    let config = ServerConfig::builder();
-    let tls_config = settings
-        .tls
-        .clone()
-        .ok_or_else(Settings::tls_config_is_undefined_error)
-        .map_err(Error::Io)?;
-
-    // Verify client CA or not
-    let config = if settings.service.verify_https_client_certificate {
-        let mut root_cert_store = RootCertStore::empty();
-        let ca_certs: Vec<CertificateDer> = with_buf_read(&tls_config.ca_cert, |rd| {
-            rustls_pemfile::certs(rd).collect()
-        })?;
-        root_cert_store.add_parsable_certificates(ca_certs);
-        let client_cert_verifier = WebPkiClientVerifier::builder(root_cert_store.into())
-            .build()
-            .map_err(Error::ClientCertVerifier)?;
-        config.with_client_cert_verifier(client_cert_verifier)
-    } else {
-        config.with_no_client_auth()
-    };
+    let (tls_config, config) = create_server_config(settings)?;
 
     // Configure rotating certificate resolver
     let ttl = match tls_config.cert_ttl {
@@ -172,6 +170,71 @@ pub fn actix_tls_server_config(settings: &Settings) -> Result<ServerConfig> {
     let config = config.with_cert_resolver(Arc::new(cert_resolver));
 
     Ok(config)
+}
+
+#[cfg(feature = "rustls-mbedtls")]
+fn create_server_config(
+    settings: &Settings,
+) -> Result<(
+    TlsConfig,
+    rustls::ConfigBuilder<ServerConfig, rustls::server::WantsServerCert>,
+)> {
+    let crypto_provider = crate::common::http_client::get_mbedtls_crypto_provider();
+    let config = ServerConfig::builder_with_provider(crypto_provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(Error::CryptoProvider)?;
+    let tls_config = settings
+        .tls
+        .clone()
+        .ok_or_else(Settings::tls_config_is_undefined_error)
+        .map_err(Error::Io)?;
+
+    // Verify client CA or not
+    let config = if settings.service.verify_https_client_certificate {
+        let ca_certs: Vec<CertificateDer> = with_buf_read(&tls_config.ca_cert, |rd| {
+            rustls_pemfile::certs(rd).collect()
+        })?;
+        let client_cert_verifier =
+            rustls_mbedpki_provider::MbedTlsClientCertVerifier::new(&ca_certs)
+                .map_err(rustls_mbedtls_provider_utils::error::mbedtls_err_into_rustls_err)
+                .map_err(Error::ClientCertVerifier)?;
+        config.with_client_cert_verifier(Arc::new(client_cert_verifier))
+    } else {
+        config.with_no_client_auth()
+    };
+    Ok((tls_config, config))
+}
+
+#[cfg(not(feature = "rustls-mbedtls"))]
+fn create_server_config(
+    settings: &Settings,
+) -> Result<(
+    TlsConfig,
+    rustls::ConfigBuilder<ServerConfig, rustls::server::WantsServerCert>,
+)> {
+    let config = ServerConfig::builder();
+    let tls_config = settings
+        .tls
+        .clone()
+        .ok_or_else(Settings::tls_config_is_undefined_error)
+        .map_err(Error::Io)?;
+
+    // Verify client CA or not
+    let config = if settings.service.verify_https_client_certificate {
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        let ca_certs: Vec<CertificateDer> = with_buf_read(&tls_config.ca_cert, |rd| {
+            rustls_pemfile::certs(rd).collect()
+        })?;
+        root_cert_store.add_parsable_certificates(ca_certs);
+        let client_cert_verifier =
+            rustls::server::WebPkiClientVerifier::builder(root_cert_store.into())
+                .build()
+                .map_err(Error::ClientCertVerifier)?;
+        config.with_client_cert_verifier(client_cert_verifier)
+    } else {
+        config.with_no_client_auth()
+    };
+    Ok((tls_config, config))
 }
 
 fn with_buf_read<T>(path: &str, f: impl FnOnce(&mut dyn BufRead) -> io::Result<T>) -> Result<T> {
@@ -198,6 +261,13 @@ pub enum Error {
     InvalidPrivateKey,
     #[error("TLS signing error")]
     Sign(#[source] rustls::Error),
+    #[cfg(feature = "rustls-mbedtls")]
+    #[error("TLS crypto provider error")]
+    CryptoProvider(#[source] rustls::Error),
+    #[cfg(not(feature = "rustls-mbedtls"))]
     #[error("client certificate verification")]
-    ClientCertVerifier(#[source] VerifierBuilderError),
+    ClientCertVerifier(#[source] rustls::client::VerifierBuilderError),
+    #[cfg(feature = "rustls-mbedtls")]
+    #[error("client certificate verification")]
+    ClientCertVerifier(#[source] rustls::Error),
 }
